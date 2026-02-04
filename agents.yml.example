@@ -33,3 +33,34 @@ parallel_agents:
 
 # When 2 or more agents are configured, parallel mode is automatically enabled
 # The agents will be available for selection when you enter a prompt
+
+# ---------------------------------------------------------------------------
+# MCP Servers – auto-loaded at startup (no need for manual /mcp load + /mcp add)
+# ---------------------------------------------------------------------------
+# mcp_servers:
+#   # SSE server (HTTP endpoint)
+#   - name: burp                          # Identifier used in /mcp list, etc.
+#     type: sse
+#     url: http://localhost:9876/sse
+#     # headers:                          # Optional – e.g. for bearer-token auth
+#     #   Authorization: "Bearer <token>"
+#     agents:                             # Bind tools to these agents automatically
+#       - web_pentester_agent
+#
+#   # SSE server with authentication
+#   - name: htb
+#     type: sse
+#     url: https://mcp.ai.hackthebox.com/v1/ctf/sse
+#     headers:
+#       Authorization: "Bearer YOUR_TOKEN"
+#     agents:
+#       - red_teamer_agent
+#
+#   # STDIO server (subprocess)
+#   - name: myserver
+#     type: stdio
+#     command: python
+#     args:
+#       - mcp_server.py
+#     agents:
+#       - one_tool_agent

@@ -412,6 +412,95 @@ class MCPCommand(Command):
             "help": "Show MCP command usage",
         }
 
+        # Auto-load MCP servers declared in agents.yml
+        self._auto_load_mcp()
+
+    def _auto_load_mcp(self):
+        """Auto-load MCP servers declared in agents.yml at startup.
+
+        Reads the ``mcp_servers`` key from agents.yml (same file that
+        ``/parallel`` uses) and, for every entry:
+          1. Connects the server (SSE or stdio) via the existing helpers.
+          2. Associates it with the agents listed in ``agents``.
+
+        This makes ``/mcp load`` + ``/mcp add`` unnecessary for servers
+        that are always needed.
+        """
+        from pathlib import Path
+
+        import yaml
+
+        config_paths = [
+            Path("agents.yml"),
+            Path(__file__).parent.parent.parent / "agents" / "patterns" / "configs" / "agents.yml",
+        ]
+
+        config_path = None
+        for path in config_paths:
+            if path.exists():
+                config_path = path
+                break
+
+        if not config_path:
+            return
+
+        try:
+            with open(config_path) as f:
+                data = yaml.safe_load(f)
+        except Exception as e:
+            console.print(f"[yellow]MCP auto-load: failed to read {config_path}: {e}[/yellow]")
+            return
+
+        if not data or not isinstance(data, dict):
+            return
+
+        mcp_servers_cfg = data.get("mcp_servers")
+        if not mcp_servers_cfg:
+            return
+
+        for entry in mcp_servers_cfg:
+            name = entry.get("name")
+            server_type = entry.get("type", "sse")
+            agents_list = entry.get("agents", [])
+
+            if not name:
+                console.print("[yellow]MCP auto-load: entry missing 'name', skipped[/yellow]")
+                continue
+
+            # --- connect the server ---
+            ok = False
+            if server_type == "sse":
+                url = entry.get("url")
+                if not url:
+                    console.print(
+                        f"[yellow]MCP auto-load: '{name}' missing 'url', skipped[/yellow]"
+                    )
+                    continue
+                headers = entry.get("headers")  # dict or None
+                ok = self._load_sse_server(url, name, headers)
+            elif server_type == "stdio":
+                command = entry.get("command")
+                if not command:
+                    console.print(
+                        f"[yellow]MCP auto-load: '{name}' missing 'command', skipped[/yellow]"
+                    )
+                    continue
+                cmd_args = entry.get("args", [])
+                ok = self._load_stdio_server(name, command, cmd_args)
+            else:
+                console.print(
+                    f"[yellow]MCP auto-load: '{name}' bad type '{server_type}', skipped[/yellow]"
+                )
+                continue
+
+            if not ok:
+                continue
+
+            # --- associate with agents ---
+            for agent_name in agents_list:
+                add_mcp_server_to_agent(agent_name, name)
+                console.print(f"[green]  ↳ bound to agent '{agent_name}'[/green]")
+
     def get_subcommands(self) -> List[str]:
         """Get list of subcommand names.
 
