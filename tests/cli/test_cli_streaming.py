@@ -341,6 +341,121 @@ class TestCLIStreaming(unittest.TestCase):
             # No need to clean up _Converter state since it's instance-based
             return False
 
+    def test_fix_message_list_deduplicates_tool_results(self):
+        """Test fix_message_list removes duplicate tool_result messages with same tool_call_id.
+
+        This test verifies the fix for Anthropic API error:
+        'each tool_use must have a single result. Found multiple tool_result blocks with id: ...'
+        """
+        from cai.util import fix_message_list
+
+        # Create messages with duplicate tool_result blocks (same tool_call_id)
+        messages = [
+            {"role": "user", "content": "Run a command"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "toolu_0163hjgafTqZabor4jiQb6EH",
+                        "type": "function",
+                        "function": {
+                            "name": "generic_linux_command",
+                            "arguments": '{"command": "ls"}',
+                        },
+                    },
+                    {
+                        "id": "toolu_01126dX8N7A4SSa9sx2MxZHR",
+                        "type": "function",
+                        "function": {
+                            "name": "generic_linux_command",
+                            "arguments": '{"command": "pwd"}',
+                        },
+                    }
+                ],
+            },
+            # First tool result for first tool
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_0163hjgafTqZabor4jiQb6EH",
+                "content": "file1.txt file2.txt"
+            },
+            # First tool result for second tool
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_01126dX8N7A4SSa9sx2MxZHR",
+                "content": "/home/user"
+            },
+            # DUPLICATE tool result for second tool - THIS SHOULD BE REMOVED
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_01126dX8N7A4SSa9sx2MxZHR",
+                "content": "/home/user (duplicate)"
+            },
+            # Another assistant message with DUPLICATE tool_calls
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "toolu_0163hjgafTqZabor4jiQb6EH",
+                        "type": "function",
+                        "function": {
+                            "name": "generic_linux_command",
+                            "arguments": '{"command": "ls"}',
+                        },
+                    },
+                    {
+                        "id": "toolu_01126dX8N7A4SSa9sx2MxZHR",
+                        "type": "function",
+                        "function": {
+                            "name": "generic_linux_command",
+                            "arguments": '{"command": "pwd"}',
+                        },
+                    }
+                ],
+            },
+            # DUPLICATE tool result for first tool - THIS SHOULD BE REMOVED
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_0163hjgafTqZabor4jiQb6EH",
+                "content": "file1.txt file2.txt (duplicate)"
+            },
+        ]
+
+        # Apply fix_message_list
+        fixed_messages = fix_message_list(messages)
+
+        # Count tool_result messages for each tool_call_id
+        tool_result_counts = {}
+        tool_call_counts = {}
+        for msg in fixed_messages:
+            if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                tool_id = msg.get("tool_call_id")
+                tool_result_counts[tool_id] = tool_result_counts.get(tool_id, 0) + 1
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg.get("tool_calls", []):
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        tool_call_counts[tc_id] = tool_call_counts.get(tc_id, 0) + 1
+
+        # Verify each tool_call_id has exactly one tool_result
+        for tool_id, count in tool_result_counts.items():
+            assert count == 1, (
+                f"Tool call ID {tool_id} should have exactly 1 tool_result, but has {count}. "
+                "This will cause Anthropic API error: 'each tool_use must have a single result'"
+            )
+
+        # Verify each tool_call_id appears at most once in assistant messages
+        for tool_id, count in tool_call_counts.items():
+            assert count == 1, (
+                f"Tool call ID {tool_id} should appear at most once in assistant messages, "
+                f"but appears {count} times. Duplicate tool_calls will cause API errors."
+            )
+
+        print("✅ fix_message_list deduplication test passed!")
+        return True
+
     def test_generic_linux_command_interrupt_simulation(self):
         """Test generic_linux_command behavior during interruption."""
 

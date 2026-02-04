@@ -1153,9 +1153,57 @@ def fix_message_list(messages):  # pylint: disable=R0914,R0915,R0912
     # Deep-copy to ensure we don't modify the input
     sanitized_messages = []
 
+    # CRITICAL FIX: First, deduplicate tool_result messages (same tool_call_id)
+    # Anthropic API requires exactly one tool_result per tool_use
+    # Keep only the FIRST occurrence of each tool_call_id for tool messages
+    seen_tool_result_ids = set()
+    seen_tool_call_ids = set()  # For assistant tool_calls
+    deduplicated_messages = []
+
+    for msg in messages:
+        if msg.get("role") == "tool" and msg.get("tool_call_id"):
+            tool_id = msg.get("tool_call_id")
+            # Normalize to 40 chars for comparison
+            normalized_id = tool_id[:40] if tool_id and len(tool_id) > 40 else tool_id
+            if normalized_id in seen_tool_result_ids:
+                # Skip duplicate tool_result
+                continue
+            seen_tool_result_ids.add(normalized_id)
+            if tool_id != normalized_id:
+                seen_tool_result_ids.add(tool_id)
+        elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+            # For assistant messages, filter out duplicate tool_calls
+            new_tool_calls = []
+            for tc in msg.get("tool_calls", []):
+                tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                if tc_id:
+                    normalized_tc_id = tc_id[:40] if len(tc_id) > 40 else tc_id
+                    if normalized_tc_id in seen_tool_call_ids:
+                        # Skip duplicate tool_call
+                        continue
+                    seen_tool_call_ids.add(normalized_tc_id)
+                    if tc_id != normalized_tc_id:
+                        seen_tool_call_ids.add(tc_id)
+                new_tool_calls.append(tc)
+
+            if not new_tool_calls:
+                # All tool_calls were duplicates, skip this message
+                # But if it has content, keep it without tool_calls
+                if msg.get("content"):
+                    msg_copy = msg.copy()
+                    del msg_copy["tool_calls"]
+                    deduplicated_messages.append(msg_copy)
+                continue
+            elif len(new_tool_calls) < len(msg.get("tool_calls", [])):
+                # Some tool_calls were duplicates
+                msg = msg.copy()
+                msg["tool_calls"] = new_tool_calls
+
+        deduplicated_messages.append(msg)
+
     # First, truncate all tool call IDs to 40 characters throughout the messages
     # This ensures consistency for providers like DeepSeek that have strict ID matching
-    for msg in messages:
+    for msg in deduplicated_messages:
         msg_copy = msg.copy()
 
         # Truncate tool_call_id in tool messages
@@ -1235,7 +1283,13 @@ def fix_message_list(messages):  # pylint: disable=R0914,R0915,R0912
     # Second pass - ensure correct sequence (tool messages must directly follow their assistant messages)
     # This fixes the error "messages with role 'tool' must be a response to a preceeding message with 'tool_calls'"
     i = 0
+    max_iterations = len(processed_messages) * 3  # Safety limit to prevent infinite loops
+    iteration_count = 0
     while i < len(processed_messages):
+        iteration_count += 1
+        if iteration_count > max_iterations:
+            # Safety break to prevent infinite loop
+            break
         msg = processed_messages[i]
 
         # Check if this is a tool message that might be out of sequence
@@ -1278,13 +1332,13 @@ def fix_message_list(messages):  # pylint: disable=R0914,R0915,R0912
 
                         # Adjust i to account for the move
                         if assistant_idx < i:
-                            # We moved the message backward, so i should point to the next message
-                            # which is now at position i (since we removed a message before it)
-                            continue
+                            # We moved the message backward, so i stays the same
+                            # (the message at i is now different)
+                            pass
                         else:
-                            # We moved the message forward, so i should now point to the message
-                            # that is now at position i
-                            continue
+                            # We moved the message forward, increment i to skip
+                            i += 1
+                        continue
                     else:
                         # No matching assistant message found - create one
                         assistant_msg = {

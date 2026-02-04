@@ -7,13 +7,13 @@ import inspect
 import json
 import os
 import re
-import time
 import sys
+import time
+import uuid
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
-import uuid
 import litellm
 import tiktoken
 from openai import NOT_GIVEN, AsyncOpenAI, AsyncStream, NotGiven
@@ -67,12 +67,11 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_input_param import FunctionCallOutput, ItemReference, Message
 from openai.types.responses.response_usage import OutputTokensDetails
-from wasabi import color
 
-from cai.sdk.agents.simple_agent_manager import SimpleAgentManager, AGENT_MANAGER
+from cai.sdk.agents.global_usage_tracker import GLOBAL_USAGE_TRACKER
 from cai.sdk.agents.parallel_isolation import PARALLEL_ISOLATION
 from cai.sdk.agents.run_to_jsonl import get_session_recorder
-from cai.sdk.agents.global_usage_tracker import GLOBAL_USAGE_TRACKER
+from cai.sdk.agents.simple_agent_manager import AGENT_MANAGER
 from cai.util import (
     _LIVE_STREAMING_PANELS,
     COST_TRACKER,
@@ -103,7 +102,11 @@ class CustomResponseUsage(ResponseUsage):
     """
     Custom ResponseUsage class that provides compatibility between different field naming conventions.
     Works with both input_tokens/output_tokens and prompt_tokens/completion_tokens.
+    Makes output_tokens_details optional to support third-party proxy providers that don't include it.
     """
+
+    # Override to make output_tokens_details optional (required by default in ResponseUsage)
+    output_tokens_details: OutputTokensDetails | None = None  # type: ignore[assignment]
 
     @property
     def prompt_tokens(self) -> int:
@@ -140,6 +143,56 @@ if TYPE_CHECKING:
 # Suppress debug info from litellm
 litellm.suppress_debug_info = True
 
+# Monkey patch LiteLLM's ResponseAPIUsage to support third-party proxies
+# Issues fixed:
+# 1. Missing output_tokens_details field (Clove and other proxies don't include it)
+# 2. Field name compatibility - intercept __init__ to handle prompt_tokens/completion_tokens
+try:
+    from pydantic.fields import FieldInfo
+    from litellm.responses.utils import ResponseAPIUsage as LiteLLMResponseAPIUsage
+
+    # Save the original __init__ method
+    _original_init = LiteLLMResponseAPIUsage.__init__
+
+    def _patched_init(self, /, **data):
+        """Patched init that handles field name conversion and optional output_tokens_details."""
+        # Convert prompt_tokens/completion_tokens to input_tokens/output_tokens if needed
+        if "input_tokens" not in data and "prompt_tokens" in data:
+            data["input_tokens"] = data["prompt_tokens"]
+
+        if "output_tokens" not in data and "completion_tokens" in data:
+            data["output_tokens"] = data["completion_tokens"]
+
+        # Ensure output_tokens_details has a default if missing
+        if "output_tokens_details" not in data:
+            data["output_tokens_details"] = None
+
+        # Call the original __init__ with the modified data
+        _original_init(self, **data)
+
+    # Replace the __init__ method
+    LiteLLMResponseAPIUsage.__init__ = _patched_init
+
+    # Make output_tokens_details optional in the model fields
+    if hasattr(LiteLLMResponseAPIUsage, "model_fields"):
+        output_tokens_details_field = LiteLLMResponseAPIUsage.model_fields.get(
+            "output_tokens_details"
+        )
+        if output_tokens_details_field and output_tokens_details_field.is_required():
+            LiteLLMResponseAPIUsage.model_fields["output_tokens_details"] = FieldInfo(
+                annotation=output_tokens_details_field.annotation,
+                default=None,
+                required=False,
+            )
+            # Rebuild the model to apply the change
+            LiteLLMResponseAPIUsage.model_rebuild(force=True)
+
+except Exception as e:
+    # If patching fails, continue without it - the error will still occur but won't break initialization
+    import warnings
+
+    warnings.warn(f"Failed to patch LiteLLM ResponseAPIUsage: {e}", stacklevel=2)
+
 if os.getenv("CAI_MODEL") == "o3-mini" or os.getenv("CAI_MODEL") == "gemini-1.5-pro":
     litellm.drop_params = True
 
@@ -148,8 +201,8 @@ _HEADERS = {"User-Agent": _USER_AGENT}
 
 # Global registry to track active model instances
 # This allows us to access instance-based histories for commands like /history
-import weakref
 import contextvars
+import weakref
 
 # DEPRECATED: Use AGENT_REGISTRY instead
 ACTIVE_MODEL_INSTANCES = {}
@@ -159,11 +212,13 @@ ACTIVE_MODEL_INSTANCES = {}
 PERSISTENT_MESSAGE_HISTORIES = {}
 
 # Context variable to track the current active model per async context
-_current_model_context = contextvars.ContextVar('current_model', default=None)
+_current_model_context = contextvars.ContextVar("current_model", default=None)
+
 
 def set_current_active_model(model):
     """Set the current active model for tool execution context."""
     _current_model_context.set(weakref.ref(model) if model else None)
+
 
 def get_current_active_model():
     """Get the current active model."""
@@ -175,7 +230,7 @@ def get_current_active_model():
 
 def get_agent_message_history(agent_name: str) -> list:
     """Get message history for a specific agent.
-    
+
     With SimpleAgentManager, this is much simpler - we only have one active agent.
     """
     # Remove any ID suffix if present (e.g., "[P1]")
@@ -183,14 +238,14 @@ def get_agent_message_history(agent_name: str) -> list:
         base_name = agent_name.rsplit("[", 1)[0].strip()
     else:
         base_name = agent_name
-    
+
     # Get history from SimpleAgentManager
     return AGENT_MANAGER.get_message_history(base_name)
 
 
 def get_all_agent_histories() -> dict:
     """Get all agent message histories.
-    
+
     With SimpleAgentManager, we only track the active agent's history.
     """
     return AGENT_MANAGER.get_all_histories()
@@ -198,7 +253,7 @@ def get_all_agent_histories() -> dict:
 
 def clear_agent_history(agent_name: str):
     """Clear history for a specific agent.
-    
+
     With SimpleAgentManager, this is much simpler.
     """
     # Remove any ID suffix if present
@@ -206,34 +261,34 @@ def clear_agent_history(agent_name: str):
         base_name = agent_name.rsplit("[", 1)[0].strip()
     else:
         base_name = agent_name
-    
+
     # Clear from SimpleAgentManager
     AGENT_MANAGER.clear_history(base_name)
-    
+
     # Also clear the current instance if it matches
     active_agent = AGENT_MANAGER.get_active_agent()
-    if active_agent and hasattr(active_agent, 'message_history'):
-        if hasattr(active_agent, 'agent_name') and active_agent.agent_name == base_name:
+    if active_agent and hasattr(active_agent, "message_history"):
+        if hasattr(active_agent, "agent_name") and active_agent.agent_name == base_name:
             active_agent.message_history.clear()
             # Reset context usage for this agent
-            os.environ['CAI_CONTEXT_USAGE'] = '0.0'
+            os.environ["CAI_CONTEXT_USAGE"] = "0.0"
 
 
 def clear_all_histories():
     """Clear all agent histories."""
     # Clear from SimpleAgentManager
     AGENT_MANAGER.clear_all_histories()
-    
+
     # Clear active agent's history if present
     active_agent = AGENT_MANAGER.get_active_agent()
-    if active_agent and hasattr(active_agent, 'message_history'):
+    if active_agent and hasattr(active_agent, "message_history"):
         active_agent.message_history.clear()
-    
+
     # Clear all persistent histories
     PERSISTENT_MESSAGE_HISTORIES.clear()
-    
+
     # Reset context usage since all histories are cleared
-    os.environ['CAI_CONTEXT_USAGE'] = '0.0'
+    os.environ["CAI_CONTEXT_USAGE"] = "0.0"
 
 
 @dataclass
@@ -389,9 +444,11 @@ class OpenAIChatCompletionsModel(Model):
         self.total_reasoning_tokens = 0
         self.total_cost = 0.0
         self.agent_name = agent_name
-        self.agent_type = agent_type or agent_name.lower().replace(" ", "_")  # For registry tracking
+        self.agent_type = agent_type or agent_name.lower().replace(
+            " ", "_"
+        )  # For registry tracking
         self.uses_unified_context = False  # Flag to indicate if using shared message history
-        
+
         # For SimpleAgentManager, we don't auto-register
         # The agent will be registered when explicitly created by cli.py
         self.agent_id = agent_id or AGENT_MANAGER.get_agent_id()
@@ -417,11 +474,11 @@ class OpenAIChatCompletionsModel(Model):
                 self.message_history = []
                 if self.agent_name not in AGENT_MANAGER._message_history:
                     AGENT_MANAGER._message_history[self.agent_name] = self.message_history
-        
+
         # NOTE: Models should NOT register themselves with AGENT_MANAGER
         # The agent that owns this model will handle registration
         # This prevents duplicate registrations with agent keys
-        
+
         # CRITICAL: Ensure AGENT_MANAGER uses the same list reference as the model
         # This is necessary for proper history clearing to work
         if agent_id is not None and not PARALLEL_ISOLATION.is_parallel_mode():
@@ -438,38 +495,38 @@ class OpenAIChatCompletionsModel(Model):
 
         # Initialize the session logger
         self.logger = get_session_recorder()
-        
+
         # DEPRECATED: Still maintain backward compatibility with ACTIVE_MODEL_INSTANCES
         # TODO: Remove this after updating all dependent code
         ACTIVE_MODEL_INSTANCES[(self._display_name, self.agent_id)] = weakref.ref(self)
-    
+
     def get_full_display_name(self) -> str:
         """Get the full display name including ID."""
         return f"{self._display_name} [{self.agent_id}]"
-    
+
     def __del__(self):
         """Clean up when the model instance is destroyed."""
         try:
             # DEPRECATED: Remove from old registry for backward compatibility
-            if hasattr(self, '_display_name') and hasattr(self, 'agent_id'):
+            if hasattr(self, "_display_name") and hasattr(self, "agent_id"):
                 key = (self._display_name, self.agent_id)
                 if key in ACTIVE_MODEL_INSTANCES:
                     del ACTIVE_MODEL_INSTANCES[key]
-            
+
             # SimpleAgentManager handles history persistence
             # No need to save to PERSISTENT_MESSAGE_HISTORIES
-                        
+
         except Exception:
             # Ignore any errors during cleanup
             pass
 
     def add_to_message_history(self, msg):
         """Add a message to this instance's history if it's not a duplicate.
-        
+
         Now only adds to the instance's local history, no global registry.
         """
         is_duplicate = False
-        
+
         if self.message_history:
             if msg.get("role") in ["system", "user"]:
                 is_duplicate = any(
@@ -484,21 +541,39 @@ class OpenAIChatCompletionsModel(Model):
                 # Remove duplicates in-place to preserve list reference (important for swarm patterns)
                 indices_to_remove = []
                 for i, existing in enumerate(self.message_history):
-                    if (existing.get("role") == "assistant"
+                    if (
+                        existing.get("role") == "assistant"
                         and existing.get("tool_calls")
-                        and existing["tool_calls"][0].get("id") == tool_call_id):
+                        and existing["tool_calls"][0].get("id") == tool_call_id
+                    ):
                         indices_to_remove.append(i)
                 # Remove in reverse order to avoid index shifting
                 for i in reversed(indices_to_remove):
                     self.message_history.pop(i)
                 is_duplicate = False  # Always add after removing duplicates
             elif msg.get("role") == "tool":
+                # Check for duplicates considering ID truncation (first 40 chars)
+                msg_tool_id = msg.get("tool_call_id")
+                if msg_tool_id and len(msg_tool_id) > 40:
+                    msg_tool_id_truncated = msg_tool_id[:40]
+                else:
+                    msg_tool_id_truncated = msg_tool_id
+
+                def _ids_match(existing_id: str | None) -> bool:
+                    if not existing_id:
+                        return False
+                    return (
+                        existing_id == msg_tool_id
+                        or existing_id == msg_tool_id_truncated
+                        or existing_id[:40] == msg_tool_id_truncated
+                    )
+
                 is_duplicate = any(
                     existing.get("role") == "tool"
-                    and existing.get("tool_call_id") == msg.get("tool_call_id")
+                    and _ids_match(existing.get("tool_call_id"))
                     for existing in self.message_history
                 )
-        
+
         if not is_duplicate:
             self.message_history.append(msg)
             # Also update SimpleAgentManager ONLY if they're not the same list reference
@@ -527,10 +602,20 @@ class OpenAIChatCompletionsModel(Model):
         handoffs: list[Handoff],
         tracing: ModelTracing,
     ) -> ModelResponse:
+        # DEBUG: Log get_response start
+        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+            print("\n" + "=" * 80)
+            print(f"🔄 CAI DEBUG: get_response() started")
+            print(f"   Model: {self.model}")
+            print(f"   Input type: {type(input)}")
+            if isinstance(input, list):
+                print(f"   Input items: {len(input)}")
+            print("=" * 80 + "\n")
+
         # Increment the interaction counter for CLI display
         self.interaction_counter += 1
         self._intermediate_logs()
-        
+
         # Set this as the current active model for tool execution context
         set_current_active_model(self)
 
@@ -547,20 +632,259 @@ class OpenAIChatCompletionsModel(Model):
             # Prepare the messages for consistent token counting
             # IMPORTANT: Include existing message history for context
             converted_messages = []
-            
+
             # First, add all existing messages from history
+            # Also deduplicate within message_history itself
+            seen_tool_result_ids_in_history = set()
+            seen_tool_call_ids_in_history = set()
             if self.message_history:
                 for msg in self.message_history:
                     msg_copy = msg.copy()  # Use copy to avoid modifying original
                     # Remove any existing cache_control to avoid exceeding the 4-block limit
                     if "cache_control" in msg_copy:
                         del msg_copy["cache_control"]
+                    # Skip duplicate tool result messages within history itself
+                    if msg_copy.get("role") == "tool" and msg_copy.get("tool_call_id"):
+                        tool_id = msg_copy.get("tool_call_id")
+                        truncated_id = tool_id[:40] if tool_id and len(tool_id) > 40 else tool_id
+                        if tool_id in seen_tool_result_ids_in_history or truncated_id in seen_tool_result_ids_in_history:
+                            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                                print(f"   ⏭️  Skipping duplicate tool_result in history: {tool_id}")
+                            continue
+                        seen_tool_result_ids_in_history.add(tool_id)
+                        if truncated_id != tool_id:
+                            seen_tool_result_ids_in_history.add(truncated_id)
+                    # Skip duplicate assistant tool_calls within history itself
+                    elif msg_copy.get("role") == "assistant" and msg_copy.get("tool_calls"):
+                        new_tool_calls = []
+                        for tc in msg_copy.get("tool_calls", []):
+                            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                            if tc_id:
+                                truncated_tc_id = tc_id[:40] if len(tc_id) > 40 else tc_id
+                                if tc_id in seen_tool_call_ids_in_history or truncated_tc_id in seen_tool_call_ids_in_history:
+                                    if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                                        print(f"   ⏭️  Skipping duplicate tool_call in history: {tc_id}")
+                                    continue
+                                seen_tool_call_ids_in_history.add(tc_id)
+                                if truncated_tc_id != tc_id:
+                                    seen_tool_call_ids_in_history.add(truncated_tc_id)
+                            new_tool_calls.append(tc)
+                        if not new_tool_calls:
+                            # Skip the entire assistant message if all tool_calls are duplicates
+                            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                                print(f"   ⏭️  Skipping entire assistant msg in history (all tool_calls duplicate)")
+                            continue
+                        elif len(new_tool_calls) < len(msg_copy.get("tool_calls", [])):
+                            msg_copy["tool_calls"] = new_tool_calls
                     converted_messages.append(msg_copy)
-            
+
             # Then convert and add the new input
-            new_messages = self._converter.items_to_messages(input, model_instance=self)
-            converted_messages.extend(new_messages)
-            
+            # IMPORTANT: If we have message_history, we need to avoid adding duplicate
+            # items from input that are already in message_history. The SDK passes
+            # all generated_items (including previous tool_calls and tool_results)
+            # in input, but those are already tracked in message_history.
+            #
+            # Strategy: If message_history has content, filter input to only include
+            # items that aren't already represented in message_history.
+            filtered_input = input
+            if self.message_history and isinstance(input, list) and len(input) > 0:
+                # Collect IDs of tool_calls and tool_results already in message_history
+                history_tool_call_ids = set()
+                history_tool_result_ids = set()
+                for msg in self.message_history:
+                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                        for tc in msg.get("tool_calls", []):
+                            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                            if tc_id:
+                                history_tool_call_ids.add(tc_id)
+                                history_tool_call_ids.add(tc_id[:40])
+                    elif msg.get("role") == "tool" and msg.get("tool_call_id"):
+                        tool_id = msg.get("tool_call_id")
+                        if tool_id:
+                            history_tool_result_ids.add(tool_id)
+                            history_tool_result_ids.add(tool_id[:40])
+
+                # Filter input to exclude items already in history
+                filtered_input = []
+                for item in input:
+                    if isinstance(item, dict):
+                        # Skip function_call items if their ID is in history
+                        if item.get("type") == "function_call":
+                            call_id = item.get("call_id", "")
+                            if call_id in history_tool_call_ids or call_id[:40] in history_tool_call_ids:
+                                if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                                    print(f"   ⏭️  Pre-filter: Skipping function_call already in history: {call_id}")
+                                continue
+                        # Skip function_call_output items if their ID is in history
+                        elif item.get("type") == "function_call_output":
+                            call_id = item.get("call_id", "")
+                            if call_id in history_tool_result_ids or call_id[:40] in history_tool_result_ids:
+                                if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                                    print(f"   ⏭️  Pre-filter: Skipping function_call_output already in history: {call_id}")
+                                continue
+                    filtered_input.append(item)
+
+                if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                    print(f"🔄 CAI DEBUG: Pre-filtered input from {len(input)} to {len(filtered_input)} items")
+
+            # DEBUG: Before items_to_messages
+            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                input_count = len(filtered_input) if isinstance(filtered_input, list) else 1
+                print(f"🔄 CAI DEBUG: Before items_to_messages (input items: {input_count})")
+
+            new_messages = self._converter.items_to_messages(filtered_input, model_instance=self)
+
+            # DEBUG: After items_to_messages
+            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                print(f"🔄 CAI DEBUG: After items_to_messages (new messages: {len(new_messages)})")
+
+            # Deduplicate tool messages AND assistant tool_calls - remove duplicates
+            # from new_messages that already exist in converted_messages.
+            # This prevents "multiple tool_result blocks with same id" errors
+            # AND "duplicate tool_use ids" errors.
+            # Store both full IDs and truncated IDs (first 40 chars) for robust
+            # deduplication.
+            existing_tool_ids = set()  # For tool results (role=tool)
+            existing_tool_call_ids = set()  # For assistant tool_calls
+
+            for msg in converted_messages:
+                # Track tool result IDs
+                if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                    tool_id = msg.get("tool_call_id")
+                    existing_tool_ids.add(tool_id)
+                    # Also add the truncated version if different, to handle mixed ID lengths
+                    if tool_id and len(tool_id) > 40:
+                        existing_tool_ids.add(tool_id[:40])
+                # Track assistant tool_call IDs
+                elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    for tc in msg.get("tool_calls", []):
+                        tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                        if tc_id:
+                            existing_tool_call_ids.add(tc_id)
+                            if len(tc_id) > 40:
+                                existing_tool_call_ids.add(tc_id[:40])
+
+            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                print(f"🔍 CAI DEBUG: Existing tool_result_ids in history: {existing_tool_ids}")
+                print(f"🔍 CAI DEBUG: Existing tool_call_ids in history: {existing_tool_call_ids}")
+                new_tool_ids = [
+                    msg.get("tool_call_id")
+                    for msg in new_messages if msg.get("role") == "tool"
+                ]
+                new_tool_call_ids = []
+                for msg in new_messages:
+                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                        for tc in msg.get("tool_calls", []):
+                            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                            if tc_id:
+                                new_tool_call_ids.append(tc_id)
+                print(f"🔍 CAI DEBUG: New tool_result_ids from input: {new_tool_ids}")
+                print(f"🔍 CAI DEBUG: New tool_call_ids from input: {new_tool_call_ids}")
+
+            deduplicated_new_messages = []
+            for msg in new_messages:
+                # Deduplicate tool results (role=tool)
+                if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                    tool_id = msg.get("tool_call_id")
+                    # Check both the full ID and truncated version
+                    truncated_id = tool_id[:40] if tool_id and len(tool_id) > 40 else tool_id
+                    if tool_id in existing_tool_ids or truncated_id in existing_tool_ids:
+                        # Skip duplicate tool message
+                        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                            print(f"   ⏭️  Skipping duplicate tool_result_id: {tool_id}")
+                        continue
+                    existing_tool_ids.add(tool_id)
+                    if truncated_id != tool_id:
+                        existing_tool_ids.add(truncated_id)
+                # Deduplicate assistant messages with tool_calls
+                elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    # Check if ALL tool_calls in this message already exist
+                    all_duplicate = True
+                    new_tool_calls = []
+                    for tc in msg.get("tool_calls", []):
+                        tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                        if tc_id:
+                            truncated_tc_id = tc_id[:40] if len(tc_id) > 40 else tc_id
+                            if tc_id not in existing_tool_call_ids and truncated_tc_id not in existing_tool_call_ids:
+                                all_duplicate = False
+                                new_tool_calls.append(tc)
+                                existing_tool_call_ids.add(tc_id)
+                                if truncated_tc_id != tc_id:
+                                    existing_tool_call_ids.add(truncated_tc_id)
+                            else:
+                                if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                                    print(f"   ⏭️  Skipping duplicate tool_call_id: {tc_id}")
+                        else:
+                            # No ID, keep it
+                            all_duplicate = False
+                            new_tool_calls.append(tc)
+
+                    if all_duplicate:
+                        # Skip the entire assistant message if all tool_calls are duplicates
+                        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                            print(f"   ⏭️  Skipping entire assistant message (all tool_calls duplicate)")
+                        continue
+                    elif len(new_tool_calls) < len(msg.get("tool_calls", [])):
+                        # Some tool_calls were duplicates, keep only the new ones
+                        msg = msg.copy()
+                        msg["tool_calls"] = new_tool_calls
+
+                deduplicated_new_messages.append(msg)
+
+            converted_messages.extend(deduplicated_new_messages)
+
+            # Final safety check: Remove any duplicate tool results AND duplicate
+            # assistant tool_calls from the merged list.
+            # This is a fallback in case earlier deduplication missed something.
+            final_tool_result_ids_seen = set()
+            final_tool_call_ids_seen = set()
+            final_converted_messages = []
+            for msg in converted_messages:
+                # Check for duplicate tool results
+                if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                    tool_id = msg.get("tool_call_id")
+                    trunc_id = tool_id[:40] if tool_id and len(tool_id) > 40 else tool_id
+                    if tool_id in final_tool_result_ids_seen or trunc_id in final_tool_result_ids_seen:
+                        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                            print(f"   🚨 FINAL DEDUP: Removing duplicate tool_result_id: {tool_id}")
+                        continue
+                    final_tool_result_ids_seen.add(tool_id)
+                    if trunc_id != tool_id:
+                        final_tool_result_ids_seen.add(trunc_id)
+                # Check for duplicate assistant tool_calls
+                elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    new_tool_calls = []
+                    for tc in msg.get("tool_calls", []):
+                        tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                        if tc_id:
+                            trunc_tc_id = tc_id[:40] if len(tc_id) > 40 else tc_id
+                            if tc_id in final_tool_call_ids_seen or trunc_tc_id in final_tool_call_ids_seen:
+                                if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                                    print(f"   🚨 FINAL DEDUP: Removing duplicate tool_call_id: {tc_id}")
+                                continue
+                            final_tool_call_ids_seen.add(tc_id)
+                            if trunc_tc_id != tc_id:
+                                final_tool_call_ids_seen.add(trunc_tc_id)
+                        new_tool_calls.append(tc)
+
+                    if not new_tool_calls:
+                        # All tool_calls were duplicates, skip the message entirely
+                        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                            print(f"   🚨 FINAL DEDUP: Removing entire assistant message (all tool_calls duplicate)")
+                        continue
+                    elif len(new_tool_calls) < len(msg.get("tool_calls", [])):
+                        # Some tool_calls were duplicates
+                        msg = msg.copy()
+                        msg["tool_calls"] = new_tool_calls
+
+                final_converted_messages.append(msg)
+            converted_messages = final_converted_messages
+
+            # DEBUG: checkpoint 1
+            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                deduped_count = len(new_messages) - len(deduplicated_new_messages)
+                print(f"🔄 CAI DEBUG: Checkpoint 1 - after extend (deduped: {deduped_count} msgs)")
+
             if system_instructions:
                 # Check if we already have a system message
                 has_system = any(msg.get("role") == "system" for msg in converted_messages)
@@ -637,6 +961,10 @@ class OpenAIChatCompletionsModel(Model):
             #     }
             #     self.add_to_message_history(sys_msg)
 
+            # DEBUG: checkpoint 2
+            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                print(f"🔄 CAI DEBUG: Checkpoint 2 - after cache_control")
+
             # Add user prompt(s) to message_history
             if isinstance(input, str):
                 user_msg = {"role": "user", "content": input}
@@ -654,6 +982,10 @@ class OpenAIChatCompletionsModel(Model):
                             if item.get("content"):
                                 self.logger.log_user_message(item.get("content"))
 
+            # DEBUG: checkpoint 3
+            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                print(f"🔄 CAI DEBUG: Checkpoint 3 - before fix_message_list")
+
             # IMPORTANT: Ensure the message list has valid tool call/result pairs
             # This needs to happen before the API call to prevent errors
             try:
@@ -663,17 +995,41 @@ class OpenAIChatCompletionsModel(Model):
             except Exception:
                 pass
 
+            # DEBUG: checkpoint 4
+            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                print(f"🔄 CAI DEBUG: Checkpoint 4 - after fix_message_list")
+                # Check for duplicate tool_call_ids
+                tool_call_ids = []
+                for msg in converted_messages:
+                    if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                        tool_call_ids.append(msg.get("tool_call_id"))
+                if len(tool_call_ids) != len(set(tool_call_ids)):
+                    print("⚠️  CAI DEBUG: DUPLICATE tool_call_ids detected!")
+                    from collections import Counter
+                    duplicates = [id for id, count in Counter(tool_call_ids).items() if count > 1]
+                    print(f"   Duplicates: {duplicates}")
+
             # Get token count estimate before API call for consistent counting
             estimated_input_tokens, _ = count_tokens_with_tiktoken(converted_messages)
-            
+
             # Calculate and set context usage for toolbar
             max_tokens = self._get_model_max_tokens(str(self.model))
             context_usage = estimated_input_tokens / max_tokens if max_tokens > 0 else 0.0
-            os.environ['CAI_CONTEXT_USAGE'] = str(context_usage)
+            os.environ["CAI_CONTEXT_USAGE"] = str(context_usage)
 
             # Check if auto-compaction is needed
-            input, system_instructions, compacted = await self._auto_compact_if_needed(estimated_input_tokens, input, system_instructions)
-            
+            # DEBUG: Before auto_compact
+            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                print(f"🔄 CAI DEBUG: Before _auto_compact_if_needed (tokens: {estimated_input_tokens})")
+
+            input, system_instructions, compacted = await self._auto_compact_if_needed(
+                estimated_input_tokens, input, system_instructions
+            )
+
+            # DEBUG: After auto_compact
+            if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                print(f"🔄 CAI DEBUG: After _auto_compact_if_needed (compacted: {compacted})")
+
             # If compaction occurred, recalculate tokens with new input
             if compacted:
                 converted_messages = self._converter.items_to_messages(input, model_instance=self)
@@ -773,54 +1129,50 @@ class OpenAIChatCompletionsModel(Model):
                     reasoning_tokens = 0
 
                 self.total_reasoning_tokens += reasoning_tokens
-            
+
             # Process costs for non-streaming mode
             model_name = str(self.model)
             interaction_cost = calculate_model_cost(model_name, input_tokens, output_tokens)
-            
+
             # Process the costs through COST_TRACKER only once
             if interaction_cost > 0.0:
                 # Check price limit before processing
                 if hasattr(COST_TRACKER, "check_price_limit"):
                     COST_TRACKER.check_price_limit(interaction_cost)
-                
+
                 # Process interaction cost
                 COST_TRACKER.process_interaction_cost(
-                    model_name,
-                    input_tokens,
-                    output_tokens,
-                    reasoning_tokens,
-                    interaction_cost
+                    model_name, input_tokens, output_tokens, reasoning_tokens, interaction_cost
                 )
-                
+
                 # Process total cost
                 total_cost = COST_TRACKER.process_total_cost(
                     model_name,
                     self.total_input_tokens,
                     self.total_output_tokens,
                     self.total_reasoning_tokens,
-                    None
+                    None,
                 )
-                
+
                 # Track usage globally
                 GLOBAL_USAGE_TRACKER.track_usage(
                     model_name=model_name,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cost=interaction_cost,
-                    agent_name=self.agent_name
+                    agent_name=self.agent_name,
                 )
             else:
                 # For free models
                 total_cost = COST_TRACKER.session_total_cost
-                
+
                 # Still track token usage even for free models
                 GLOBAL_USAGE_TRACKER.track_usage(
                     model_name=model_name,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cost=0.0,
-                    agent_name=self.agent_name
+                    agent_name=self.agent_name,
                 )
 
             # Check if this message contains tool calls
@@ -851,9 +1203,11 @@ class OpenAIChatCompletionsModel(Model):
 
                             # Handle empty arguments before trying to parse JSON
                             tool_args = tool_call.function.arguments
-                            if tool_args is None or (isinstance(tool_args, str) and tool_args.strip() == ""):
+                            if tool_args is None or (
+                                isinstance(tool_args, str) and tool_args.strip() == ""
+                            ):
                                 tool_args = "{}"
-                            
+
                             args = json.loads(tool_args)
                             # Check if this is a regular command (not a session command)
                             if (
@@ -981,7 +1335,6 @@ class OpenAIChatCompletionsModel(Model):
                 if not hasattr(self, "_pending_tool_calls"):
                     self._pending_tool_calls = {}
 
-
                 # Fix Google Gemini OpenAI compatibility issues.
                 # When using the OpenAI-compatible API to call tools with Google Gemini
                 # tool_call.id is returned as an empty string.
@@ -993,9 +1346,11 @@ class OpenAIChatCompletionsModel(Model):
                 for tool_call in assistant_msg.tool_calls:
                     # Handle empty arguments before storing
                     tool_args = tool_call.function.arguments
-                    if tool_args is None or (isinstance(tool_args, str) and tool_args.strip() == ""):
+                    if tool_args is None or (
+                        isinstance(tool_args, str) and tool_args.strip() == ""
+                    ):
                         tool_args = "{}"
-                    
+
                     # Compose a message for the tool call
                     tool_call_msg = {
                         "role": "assistant",
@@ -1057,19 +1412,25 @@ class OpenAIChatCompletionsModel(Model):
 
             # Además, necesitamos añadir los tool outputs que se hayan generado
             # durante la ejecución de las herramientas
-            if hasattr(_Converter, "tool_outputs"):
+            if hasattr(self._converter, "tool_outputs"):
                 for call_id, output_content in self._converter.tool_outputs.items():
-                    # Verificar si ya existe un mensaje tool con este call_id en message_history
+                    # Truncate call_id to 40 characters for consistency with other code paths
+                    truncated_call_id = call_id[:40] if call_id else call_id
+                    # Verificar si ya existe un mensaje tool con este call_id en self.message_history
+                    # Check both truncated and original IDs for backwards compatibility
                     tool_msg_exists = any(
-                        msg.get("role") == "tool" and msg.get("tool_call_id") == call_id
-                        for msg in message_history
+                        msg.get("role") == "tool" and (
+                            msg.get("tool_call_id") == truncated_call_id or
+                            msg.get("tool_call_id") == call_id
+                        )
+                        for msg in self.message_history
                     )
 
                     if not tool_msg_exists:
-                        # Añadir el mensaje tool al message_history
+                        # Añadir el mensaje tool al self.message_history
                         tool_msg = {
                             "role": "tool",
-                            "tool_call_id": call_id,
+                            "tool_call_id": truncated_call_id,
                             "content": output_content,
                         }
                         self.add_to_message_history(tool_msg)
@@ -1180,7 +1541,7 @@ class OpenAIChatCompletionsModel(Model):
 
                         # Update input with the fixed version
                         input = new_input
-                except Exception as e:
+                except Exception:
                     # Silently continue with original input if pre-processing failed
                     # This is not critical and shouldn't show warnings
                     pass
@@ -1207,7 +1568,7 @@ class OpenAIChatCompletionsModel(Model):
                         counter=self.interaction_counter,
                         model=str(self.model),
                     )
-                except Exception as e:
+                except Exception:
                     # Silently fall back to non-streaming display
                     streaming_context = None
 
@@ -1309,13 +1670,19 @@ class OpenAIChatCompletionsModel(Model):
                 estimated_input_tokens, _ = count_tokens_with_tiktoken(converted_messages)
 
                 # Check if auto-compaction is needed
-                input, system_instructions, compacted = await self._auto_compact_if_needed(estimated_input_tokens, input, system_instructions)
-                
+                input, system_instructions, compacted = await self._auto_compact_if_needed(
+                    estimated_input_tokens, input, system_instructions
+                )
+
                 # If compaction occurred, recalculate tokens with new input
                 if compacted:
-                    converted_messages = self._converter.items_to_messages(input, model_instance=self)
+                    converted_messages = self._converter.items_to_messages(
+                        input, model_instance=self
+                    )
                     if system_instructions:
-                        converted_messages.insert(0, {"role": "system", "content": system_instructions})
+                        converted_messages.insert(
+                            0, {"role": "system", "content": system_instructions}
+                        )
                     estimated_input_tokens, _ = count_tokens_with_tiktoken(converted_messages)
 
                 # Pre-check price limit using estimated input tokens and a conservative estimate for output
@@ -1817,9 +2184,11 @@ class OpenAIChatCompletionsModel(Model):
                                 # Only add if not already present (avoid duplicates in streaming)
                                 # Handle empty arguments before storing
                                 tool_args = state.function_calls[tc_index].arguments
-                                if tool_args is None or (isinstance(tool_args, str) and tool_args.strip() == ""):
+                                if tool_args is None or (
+                                    isinstance(tool_args, str) and tool_args.strip() == ""
+                                ):
                                     tool_args = "{}"
-                                
+
                                 tool_call_msg = {
                                     "role": "assistant",
                                     "content": None,
@@ -2173,19 +2542,24 @@ class OpenAIChatCompletionsModel(Model):
                     output_tokens = usage.completion_tokens
 
                 # Create a proper usage object with our token counts
+                # Only include output_tokens_details if we have reasoning tokens (supports third-party proxies)
+                reasoning_tokens = (
+                    usage.completion_tokens_details.reasoning_tokens
+                    if usage
+                    and hasattr(usage, "completion_tokens_details")
+                    and usage.completion_tokens_details
+                    and hasattr(usage.completion_tokens_details, "reasoning_tokens")
+                    and usage.completion_tokens_details.reasoning_tokens
+                    else 0
+                )
+
                 final_response.usage = CustomResponseUsage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     total_tokens=input_tokens + output_tokens,
-                    output_tokens_details=OutputTokensDetails(
-                        reasoning_tokens=usage.completion_tokens_details.reasoning_tokens
-                        if usage
-                        and hasattr(usage, "completion_tokens_details")
-                        and usage.completion_tokens_details
-                        and hasattr(usage.completion_tokens_details, "reasoning_tokens")
-                        and usage.completion_tokens_details.reasoning_tokens
-                        else 0
-                    ),
+                    output_tokens_details=OutputTokensDetails(reasoning_tokens=reasoning_tokens)
+                    if reasoning_tokens > 0
+                    else None,
                     input_tokens_details={
                         "prompt_tokens": input_tokens,
                         "cached_tokens": usage.prompt_tokens_details.cached_tokens
@@ -2272,25 +2646,25 @@ class OpenAIChatCompletionsModel(Model):
                         and final_response.usage.output_tokens_details
                         and hasattr(final_response.usage.output_tokens_details, "reasoning_tokens")
                         else 0,
-                        interaction_cost
+                        interaction_cost,
                     )
-                    
+
                     # Process the total cost (updates session total correctly)
                     total_cost = COST_TRACKER.process_total_cost(
                         model_name,
                         total_input,
                         total_output,
                         getattr(self, "total_reasoning_tokens", 0),
-                        None  # Let it calculate from tokens
+                        None,  # Let it calculate from tokens
                     )
-                    
+
                     # Track usage globally
                     GLOBAL_USAGE_TRACKER.track_usage(
                         model_name=model_name,
                         input_tokens=interaction_input,
                         output_tokens=interaction_output,
                         cost=interaction_cost,
-                        agent_name=self.agent_name
+                        agent_name=self.agent_name,
                     )
                 else:
                     # For free models, still track token usage
@@ -2299,7 +2673,7 @@ class OpenAIChatCompletionsModel(Model):
                         input_tokens=interaction_input,
                         output_tokens=interaction_output,
                         cost=0.0,
-                        agent_name=self.agent_name
+                        agent_name=self.agent_name,
                     )
 
                 # Store the total cost for future recording
@@ -2433,10 +2807,10 @@ class OpenAIChatCompletionsModel(Model):
                     tool_response_msg = {
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": "Tool execution interrupted"
+                        "content": "Tool execution interrupted",
                     }
                     self.add_to_message_history(tool_response_msg)
-                    
+
             except Exception as cleanup_error:
                 # Don't let cleanup errors mask the original KeyboardInterrupt
                 logger.debug(f"Error during interrupt cleanup: {cleanup_error}")
@@ -2547,7 +2921,7 @@ class OpenAIChatCompletionsModel(Model):
 
         # IMPORTANT: Include existing message history for context
         converted_messages = []
-        
+
         # First, add all existing messages from history
         if self.message_history:
             for msg in self.message_history:
@@ -2556,7 +2930,7 @@ class OpenAIChatCompletionsModel(Model):
                 if "cache_control" in msg_copy:
                     del msg_copy["cache_control"]
                 converted_messages.append(msg_copy)
-        
+
         # Then convert and add the new input
         new_messages = self._converter.items_to_messages(input, model_instance=self)
         converted_messages.extend(new_messages)
@@ -2699,7 +3073,7 @@ class OpenAIChatCompletionsModel(Model):
         # Determine provider based on model string
         model_str = str(kwargs["model"]).lower()
 
-        if "alias" in model_str and "alias1.5" not in model_str:  # NOTE: exclude alias1.5
+        if "alias" in model_str and "alias1.5" not in model_str:  # NOTE: exclude alias1.5
             kwargs["api_base"] = "https://api.aliasrobotics.com:666/"
             kwargs["custom_llm_provider"] = "openai"
             kwargs["api_key"] = os.getenv("ALIAS_API_KEY", "REDACTED_ALIAS_KEY")
@@ -2712,12 +3086,12 @@ class OpenAIChatCompletionsModel(Model):
                 # Ollama Cloud configuration
                 ollama_api_key = os.getenv("OLLAMA_API_KEY")
                 ollama_api_base = os.getenv("OLLAMA_API_BASE", "https://ollama.com")
-                
+
                 if ollama_api_key:
                     kwargs["api_key"] = ollama_api_key
                 if ollama_api_base:
                     kwargs["api_base"] = ollama_api_base
-                    
+
                 # Drop params not supported by Ollama
                 litellm.drop_params = True
                 kwargs.pop("parallel_tool_calls", None)
@@ -2741,6 +3115,7 @@ class OpenAIChatCompletionsModel(Model):
                     kwargs["reasoning_effort"] = "low"
             elif provider == "claude" or "claude" in model_str:
                 litellm.drop_params = True
+                kwargs["custom_llm_provider"] = "anthropic"
                 kwargs.pop("store", None)
                 kwargs.pop(
                     "parallel_tool_calls", None
@@ -2748,6 +3123,10 @@ class OpenAIChatCompletionsModel(Model):
                 # Remove tool_choice if no tools are specified
                 if not converted_tools:
                     kwargs.pop("tool_choice", None)
+                # Support custom Anthropic base URL for proxies like Clove
+                anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL")
+                if anthropic_base_url:
+                    kwargs["api_base"] = anthropic_base_url
 
                 # Add extended reasoning support for Claude models
                 # Supports Claude 3.7, Claude 4, and any model with "thinking" in the name
@@ -2793,12 +3172,17 @@ class OpenAIChatCompletionsModel(Model):
             # Handle models without provider prefix
             if "claude" in model_str or "anthropic" in model_str:
                 litellm.drop_params = True
+                kwargs["custom_llm_provider"] = "anthropic"
                 # Remove parameters that Anthropic doesn't support
                 kwargs.pop("store", None)
                 kwargs.pop("parallel_tool_calls", None)
                 # Remove tool_choice if no tools are specified
                 if not converted_tools:
                     kwargs.pop("tool_choice", None)
+                # Support custom Anthropic base URL for proxies like Clove
+                anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL")
+                if anthropic_base_url:
+                    kwargs["api_base"] = anthropic_base_url
 
                 # Add extended reasoning support for Claude models
                 # Supports Claude 3.7, Claude 4, and any model with "thinking" in the name
@@ -2858,14 +3242,27 @@ class OpenAIChatCompletionsModel(Model):
                 filtered_kwargs[key] = value
         kwargs = filtered_kwargs
 
+        # DEBUG: Print full request JSON for debugging API issues
+        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+            import copy
+            debug_kwargs = copy.deepcopy(kwargs)
+            # Remove tools from debug output to reduce noise (they're usually large)
+            if "tools" in debug_kwargs and os.getenv("CAI_DEBUG_TOOLS", "").lower() != "true":
+                debug_kwargs["tools"] = f"[{len(debug_kwargs['tools'])} tools - set CAI_DEBUG_TOOLS=true to show]"
+            print("\n" + "=" * 80)
+            print("🔍 CAI DEBUG: Full request JSON being sent to API:")
+            print("=" * 80)
+            print(json.dumps(debug_kwargs, indent=2, default=str))
+            print("=" * 80 + "\n")
+
         # Add retry logic for rate limits
         max_retries = 3
         retry_count = 0
-        
+
         # Check if this is Ollama Cloud (ollama_cloud/ prefix)
         # Ollama Cloud is OpenAI-compatible, so we bypass LiteLLM to avoid parsing issues
         is_ollama_cloud = "ollama_cloud/" in model_str
-        
+
         if is_ollama_cloud:
             # Use AsyncOpenAI client directly for Ollama Cloud
             # Ollama Cloud is fully OpenAI-compatible at /v1/chat/completions
@@ -2873,42 +3270,41 @@ class OpenAIChatCompletionsModel(Model):
                 # Configure the client with Ollama Cloud settings
                 ollama_api_key = os.getenv("OLLAMA_API_KEY") or os.getenv("OPENAI_API_KEY")
                 ollama_base_url = os.getenv("OLLAMA_API_BASE", "https://ollama.com")
-                
+
                 # Ensure the URL has /v1 for OpenAI compatibility
                 if not ollama_base_url.endswith("/v1"):
                     ollama_base_url = f"{ollama_base_url}/v1"
-                
+
                 # Create a temporary client configured for Ollama Cloud
-                ollama_client = AsyncOpenAI(
-                    api_key=ollama_api_key,
-                    base_url=ollama_base_url
-                )
-                
+                ollama_client = AsyncOpenAI(api_key=ollama_api_key, base_url=ollama_base_url)
+
                 # Remove the ollama_cloud/ prefix from the model name
                 clean_model = kwargs["model"].replace("ollama_cloud/", "")
                 kwargs["model"] = clean_model
-                
+
                 # Remove LiteLLM-specific parameters
                 kwargs.pop("extra_headers", None)
                 kwargs.pop("api_key", None)
                 kwargs.pop("api_base", None)
                 kwargs.pop("custom_llm_provider", None)
-                
+
                 # Call Ollama Cloud using OpenAI-compatible API
                 if stream:
                     return await ollama_client.chat.completions.create(**kwargs)
                 else:
                     return await ollama_client.chat.completions.create(**kwargs)
-                    
+
             except Exception as e:
                 # If Ollama Cloud fails, raise with helpful message
                 raise Exception(
                     f"Error connecting to Ollama Cloud: {str(e)}\n"
                     f"Verify OLLAMA_API_KEY and OLLAMA_API_BASE are configured correctly."
                 ) from e
-        
+
         while retry_count < max_retries:
             try:
+                if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                    print(f"\n🔁 CAI DEBUG: Retry loop iteration {retry_count + 1}/{max_retries}")
                 if self.is_ollama:
                     return await self._fetch_response_litellm_ollama(
                         kwargs, model_settings, tool_choice, stream, parallel_tool_calls
@@ -2922,8 +3318,10 @@ class OpenAIChatCompletionsModel(Model):
                 if retry_count >= max_retries:
                     print(f"\n❌ Rate limit exceeded after {max_retries} retries")
                     raise
-                
-                print(f"\n⏳ Rate limit reached - Too many requests (attempt {retry_count}/{max_retries})")
+
+                print(
+                    f"\n⏳ Rate limit reached - Too many requests (attempt {retry_count}/{max_retries})"
+                )
                 # Try to extract retry delay from error response or use default
                 retry_delay = 60  # Default delay in seconds
                 try:
@@ -2944,28 +3342,34 @@ class OpenAIChatCompletionsModel(Model):
                 except Exception:
                     # Try other common formats
                     import re
+
                     error_str = str(e)
-                    
+
                     # Look for "Retry-After" header or similar patterns
-                    retry_match = re.search(r'retry[_-]?after[:\s]+(\d+)', error_str, re.IGNORECASE)
+                    retry_match = re.search(r"retry[_-]?after[:\s]+(\d+)", error_str, re.IGNORECASE)
                     if retry_match:
                         retry_delay = int(retry_match.group(1))
                     # Look for "wait X seconds" patterns
-                    elif wait_match := re.search(r'wait\s+(\d+)\s+seconds?', error_str, re.IGNORECASE):
+                    elif wait_match := re.search(
+                        r"wait\s+(\d+)\s+seconds?", error_str, re.IGNORECASE
+                    ):
                         retry_delay = int(wait_match.group(1))
                     # Look for explicit retry delay mentions
-                    elif delay_match := re.search(r'retry\s+in\s+(\d+)\s+seconds?', error_str, re.IGNORECASE):
+                    elif delay_match := re.search(
+                        r"retry\s+in\s+(\d+)\s+seconds?", error_str, re.IGNORECASE
+                    ):
                         retry_delay = int(delay_match.group(1))
 
                 # Use exponential backoff with jitter if no explicit delay found
                 if retry_count > 1 and retry_delay == 60:
                     import random
+
                     retry_delay = min(300, retry_delay * retry_count) + random.randint(0, 10)
-                
+
                 print(f"💤 Waiting {retry_delay}s before retry... (Rate limit protection)")
                 await asyncio.sleep(retry_delay)  # Use async sleep instead of time.sleep
                 continue  # Retry the request
-                
+
             except litellm.exceptions.BadRequestError as e:
                 error_msg = str(e)
 
@@ -3081,13 +3485,21 @@ class OpenAIChatCompletionsModel(Model):
                                 hasattr(model_settings, "reasoning_effort")
                                 and model_settings.reasoning_effort
                             ):
-                                provider_kwargs["reasoning_effort"] = model_settings.reasoning_effort
+                                provider_kwargs["reasoning_effort"] = (
+                                    model_settings.reasoning_effort
+                                )
                             else:
                                 # Default to "low" reasoning effort
                                 provider_kwargs["reasoning_effort"] = "low"
                         elif provider == "claude" or "claude" in model_str:
                             provider_kwargs["custom_llm_provider"] = "anthropic"
-                            provider_kwargs.pop("store", None)  # Claude doesn't support store parameter
+                            # Support custom Anthropic base URL for proxies like Clove
+                            anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL")
+                            if anthropic_base_url:
+                                provider_kwargs["api_base"] = anthropic_base_url
+                            provider_kwargs.pop(
+                                "store", None
+                            )  # Claude doesn't support store parameter
                             provider_kwargs.pop(
                                 "parallel_tool_calls", None
                             )  # Claude doesn't support parallel tool calls
@@ -3096,7 +3508,10 @@ class OpenAIChatCompletionsModel(Model):
                             if "thinking" in model_str:
                                 # Clean the model name by removing "thinking" before sending to API
                                 clean_model = provider_kwargs["model"]
-                                if isinstance(clean_model, str) and "thinking" in clean_model.lower():
+                                if (
+                                    isinstance(clean_model, str)
+                                    and "thinking" in clean_model.lower()
+                                ):
                                     # Remove "thinking" and clean up any extra spaces/separators
                                     clean_model = re.sub(
                                         r"[_-]?thinking[_-]?", "", clean_model, flags=re.IGNORECASE
@@ -3119,7 +3534,9 @@ class OpenAIChatCompletionsModel(Model):
                                     )
                         elif provider == "gemini":
                             provider_kwargs["custom_llm_provider"] = "gemini"
-                            provider_kwargs.pop("store", None)  # Gemini doesn't support store parameter
+                            provider_kwargs.pop(
+                                "store", None
+                            )  # Gemini doesn't support store parameter
                             provider_kwargs.pop(
                                 "parallel_tool_calls", None
                             )  # Gemini doesn't support parallel tool calls
@@ -3128,7 +3545,7 @@ class OpenAIChatCompletionsModel(Model):
                             return await self._fetch_response_litellm_ollama(
                                 kwargs, model_settings, tool_choice, stream, parallel_tool_calls
                             )
-                
+
                 # Check for message sequence errors
                 if (
                     "An assistant message with 'tool_calls'" in str(e)
@@ -3189,7 +3606,9 @@ class OpenAIChatCompletionsModel(Model):
                             try:
                                 from cai.util import print_message_history
 
-                                print_message_history(fixed_messages, title="Fixed Message Sequence")
+                                print_message_history(
+                                    fixed_messages, title="Fixed Message Sequence"
+                                )
                             except ImportError:
                                 print("✅ Message sequence fixed successfully")
 
@@ -3220,7 +3639,9 @@ class OpenAIChatCompletionsModel(Model):
                     e
                 ) or "cache_control cannot be set for empty text blocks" in str(e):  # noqa
                     # Print the error message only once
-                    print("⚠️  Empty text blocks detected - Adding placeholder content") if not self.empty_content_error_shown else None
+                    print(
+                        "⚠️  Empty text blocks detected - Adding placeholder content"
+                    ) if not self.empty_content_error_shown else None
                     self.empty_content_error_shown = True
 
                     # Fix for empty content in messages for Anthropic models
@@ -3241,26 +3662,30 @@ class OpenAIChatCompletionsModel(Model):
                     raise
                 # Check for context length errors in BadRequestError
                 if (
-                    "context_length_exceeded" in str(e) 
+                    "context_length_exceeded" in str(e)
                     or "prompt is too long" in str(e).lower()
                     or "maximum context length" in str(e).lower()
-                    or "max_tokens" in str(e) and "exceeded" in str(e).lower()
+                    or "max_tokens" in str(e)
+                    and "exceeded" in str(e).lower()
                     or "too many tokens" in str(e).lower()
                     or "token limit" in str(e).lower()
                 ):
                     print("\n📦 Context window exceeded - Message history too long")
-                    
+
                     # Try to extract token info from different error formats
                     import re
+
                     error_str = str(e)
-                    
+
                     # Pattern 1: "X tokens > Y maximum" (Anthropic)
-                    match1 = re.search(r'(\d+)\s*tokens?\s*>\s*(\d+)\s*maximum', error_str)
+                    match1 = re.search(r"(\d+)\s*tokens?\s*>\s*(\d+)\s*maximum", error_str)
                     # Pattern 2: "requested X tokens...maximum context length is Y" (OpenAI)
-                    match2 = re.search(r'requested\s+(\d+)\s+tokens.*maximum.*?(\d+)', error_str)
+                    match2 = re.search(r"requested\s+(\d+)\s+tokens.*maximum.*?(\d+)", error_str)
                     # Pattern 3: "This model's maximum context length is X tokens, however you requested Y"
-                    match3 = re.search(r'maximum context length is\s+(\d+).*requested\s+(\d+)', error_str)
-                    
+                    match3 = re.search(
+                        r"maximum context length is\s+(\d+).*requested\s+(\d+)", error_str
+                    )
+
                     if match1:
                         used_tokens = int(match1.group(1))
                         max_tokens = int(match1.group(2))
@@ -3273,17 +3698,17 @@ class OpenAIChatCompletionsModel(Model):
                         max_tokens = int(match3.group(1))
                         used_tokens = int(match3.group(2))
                         print(f"🎯 Requested: {used_tokens:,} tokens (max: {max_tokens:,})")
-                    elif 'estimated_input_tokens' in locals():
+                    elif "estimated_input_tokens" in locals():
                         print(f"📊 Estimated tokens: ~{estimated_input_tokens:,}")
                         # Get model's max tokens
                         model_max = self._get_model_max_tokens(str(self.model))
                         print(f"🎯 Model limit: {model_max:,} tokens")
-                    
+
                     print("\n💡 Quick fixes:")
                     print("  • /flush - Clear conversation history")
                     print("  • /compact - Manually compact context")
                     print("  • /model <larger-model> - Switch to model with more context")
-                    
+
                     raise
             else:
                 raise e
@@ -3325,7 +3750,66 @@ class OpenAIChatCompletionsModel(Model):
                 return response, stream_obj
             else:
                 # Standard OpenAI handling for non-streaming
-                ret = await litellm.acompletion(**kwargs)
+                if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                    print("\n🚀 CAI DEBUG: About to call litellm.acompletion (non-streaming)...")
+                    # Debug: Print all tool_call_ids to find duplicates
+                    messages = kwargs.get("messages", [])
+                    tool_call_ids_seen = []
+                    tool_result_ids_seen = []
+                    for i, msg in enumerate(messages):
+                        role = msg.get("role", "unknown")
+                        if role == "assistant" and msg.get("tool_calls"):
+                            for tc in msg.get("tool_calls", []):
+                                tc_id = tc.get("id", "no-id")
+                                tool_call_ids_seen.append(tc_id)
+                                print(f"   [msg {i}] assistant tool_call id: {tc_id}")
+                        elif role == "tool":
+                            tc_id = msg.get("tool_call_id", "no-id")
+                            tool_result_ids_seen.append(tc_id)
+                            print(f"   [msg {i}] tool result id: {tc_id}")
+                    # Check for duplicates
+                    from collections import Counter
+                    tc_counter = Counter(tool_call_ids_seen)
+                    tr_counter = Counter(tool_result_ids_seen)
+                    tc_dups = {k: v for k, v in tc_counter.items() if v > 1}
+                    tr_dups = {k: v for k, v in tr_counter.items() if v > 1}
+                    if tc_dups:
+                        print(f"   ⚠️  DUPLICATE tool_call ids: {tc_dups}")
+                    if tr_dups:
+                        print(f"   ⚠️  DUPLICATE tool_result ids: {tr_dups}")
+                try:
+                    ret = await litellm.acompletion(**kwargs)
+                except Exception as acompletion_error:
+                    if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                        print(f"\n❌ CAI DEBUG: litellm.acompletion raised exception: {type(acompletion_error).__name__}")
+                        print(f"   Error message: {str(acompletion_error)[:500]}")
+                    raise
+                if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                    print("✅ CAI DEBUG: litellm.acompletion returned successfully")
+                    # Check what was returned
+                    if ret and hasattr(ret, 'choices') and ret.choices:
+                        choice = ret.choices[0]
+                        msg = choice.message if hasattr(choice, 'message') else None
+                        if msg:
+                            print(f"   Response content: {msg.content[:100] if msg.content else 'None'}...")
+                            print(f"   Tool calls: {len(msg.tool_calls) if msg.tool_calls else 0}")
+                # DEBUG: Print full response for debugging API issues
+                if os.getenv("CAI_DEBUG_RESPONSE", "").lower() == "true":
+                    print("\n" + "=" * 80)
+                    print("🔍 CAI DEBUG: Full API response received:")
+                    print("=" * 80)
+                    try:
+                        # Try to convert to dict for pretty printing
+                        if hasattr(ret, "model_dump"):
+                            print(json.dumps(ret.model_dump(), indent=2, default=str))
+                        elif hasattr(ret, "__dict__"):
+                            print(json.dumps(ret.__dict__, indent=2, default=str))
+                        else:
+                            print(str(ret))
+                    except Exception as debug_err:
+                        print(f"Could not serialize response: {debug_err}")
+                        print(f"Raw response: {ret}")
+                    print("=" * 80 + "\n")
                 return ret
         except Exception as e:
             error_msg = str(e)
@@ -3470,6 +3954,7 @@ class OpenAIChatCompletionsModel(Model):
         """Get the maximum input tokens for a model from pricing.json or default."""
         try:
             import pathlib
+
             pricing_path = pathlib.Path("pricing.json")
             if pricing_path.exists():
                 with open(pricing_path, encoding="utf-8") as f:
@@ -3481,60 +3966,69 @@ class OpenAIChatCompletionsModel(Model):
         # Default to 200k if not found
         return 200000
 
-    async def _auto_compact_if_needed(self, estimated_tokens: int, input: str | list[TResponseInputItem], system_instructions: str | None) -> tuple[str | list[TResponseInputItem], str | None, bool]:
+    async def _auto_compact_if_needed(
+        self,
+        estimated_tokens: int,
+        input: str | list[TResponseInputItem],
+        system_instructions: str | None,
+    ) -> tuple[str | list[TResponseInputItem], str | None, bool]:
         """Check if auto-compaction is needed and perform it if necessary.
-        
+
         Returns:
             tuple: (potentially modified input, potentially modified system_instructions, whether compaction occurred)
         """
         # Check if auto-compaction is disabled
         if os.getenv("CAI_AUTO_COMPACT", "true").lower() == "false":
             return input, system_instructions, False
-            
+
         max_tokens = self._get_model_max_tokens(str(self.model))
         threshold_percent = float(os.getenv("CAI_AUTO_COMPACT_THRESHOLD", "0.8"))
         threshold = max_tokens * threshold_percent
-        
+
         if estimated_tokens <= threshold:
             return input, system_instructions, False
-            
+
         # Auto-compaction needed
         from rich.console import Console
+
         console = Console()
-        
+
         # Update context usage in environment for toolbar
         context_usage = estimated_tokens / max_tokens
-        os.environ['CAI_CONTEXT_USAGE'] = str(context_usage)
-        
-        console.print(f"\n[yellow]⚠️  Context usage at {(estimated_tokens/max_tokens)*100:.1f}% ({estimated_tokens:,}/{max_tokens:,} tokens)[/yellow]")
+        os.environ["CAI_CONTEXT_USAGE"] = str(context_usage)
+
+        console.print(
+            f"\n[yellow]⚠️  Context usage at {(estimated_tokens / max_tokens) * 100:.1f}% ({estimated_tokens:,}/{max_tokens:,} tokens)[/yellow]"
+        )
         console.print("[yellow]Triggering automatic context compaction...[/yellow]\n")
-        
+
         # Import compact command components
         try:
             from cai.repl.commands.memory import MEMORY_COMMAND_INSTANCE
-            
+
             # Generate AI summary of the conversation
             summary = await MEMORY_COMMAND_INSTANCE._ai_summarize_history(self.agent_name)
-            
+
             if summary:
                 # Store the summary
                 from cai.repl.commands.memory import COMPACTED_SUMMARIES
+
                 COMPACTED_SUMMARIES[self.agent_name] = summary
-                
+
                 # Clear the message history and keep only essential messages
                 self.message_history.clear()
                 # Reset context usage after clearing
-                os.environ['CAI_CONTEXT_USAGE'] = '0.0'
-                
+                os.environ["CAI_CONTEXT_USAGE"] = "0.0"
+
                 # Reset context usage since we cleared history
-                os.environ['CAI_CONTEXT_USAGE'] = '0.0'
-                
+                os.environ["CAI_CONTEXT_USAGE"] = "0.0"
+
                 # Create new input with summary
                 new_system_instructions = system_instructions or ""
                 if new_system_instructions:
                     new_system_instructions += "\n\n"
                 new_system_instructions += f"Previous conversation summary:\n{summary}"
-                
+
                 # Keep only the current input (user's latest message)
                 if isinstance(input, str):
                     new_input = input
@@ -3542,33 +4036,35 @@ class OpenAIChatCompletionsModel(Model):
                     # For list input, keep only user messages
                     new_input = []
                     for item in input:
-                        if hasattr(item, 'role') and item.role == 'user':
+                        if hasattr(item, "role") and item.role == "user":
                             new_input.append(item)
-                        elif isinstance(item, dict) and item.get('role') == 'user':
+                        elif isinstance(item, dict) and item.get("role") == "user":
                             new_input.append(item)
-                    
+
                     # If no user messages found, keep the original input
                     if not new_input:
                         new_input = input
-                
+
                 # Re-estimate tokens with compacted context
                 test_messages = self._converter.items_to_messages(new_input, model_instance=self)
                 if new_system_instructions:
                     test_messages.insert(0, {"role": "system", "content": new_system_instructions})
                 new_tokens, _ = count_tokens_with_tiktoken(test_messages)
-                
-                console.print(f"[green]✓ Context compacted: {estimated_tokens:,} → {new_tokens:,} tokens ({(1-new_tokens/estimated_tokens)*100:.1f}% reduction)[/green]\n")
-                
+
+                console.print(
+                    f"[green]✓ Context compacted: {estimated_tokens:,} → {new_tokens:,} tokens ({(1 - new_tokens / estimated_tokens) * 100:.1f}% reduction)[/green]\n"
+                )
+
                 # Update context usage after compaction
                 new_context_usage = new_tokens / max_tokens if max_tokens > 0 else 0.0
-                os.environ['CAI_CONTEXT_USAGE'] = str(new_context_usage)
-                
+                os.environ["CAI_CONTEXT_USAGE"] = str(new_context_usage)
+
                 return new_input, new_system_instructions, True
-                
+
         except Exception as e:
             console.print(f"[red]Auto-compaction failed: {e}[/red]")
             console.print("[yellow]Continuing with full context...[/yellow]\n")
-        
+
         return input, system_instructions, False
 
     def _intermediate_logs(self):
@@ -3852,9 +4348,7 @@ class _Converter:
             elif isinstance(c, dict) and c.get("type") == "input_image":
                 casted_image_param = cast(ResponseInputImageParam, c)
                 if "image_url" not in casted_image_param or not casted_image_param["image_url"]:
-                    raise UserError(
-                        "🖼️ Image URLs required - Upload images to a URL first"
-                    )
+                    raise UserError("🖼️ Image URLs required - Upload images to a URL first")
                 out.append(
                     ChatCompletionContentPartImageParam(
                         type="image_url",
@@ -3867,7 +4361,9 @@ class _Converter:
             elif isinstance(c, dict) and c.get("type") == "input_file":
                 raise UserError("📄 File uploads not supported - Use image URLs or text content")
             else:
-                raise UserError(f"❓ Unrecognized content type - Expected 'input_text' or 'input_image'")
+                raise UserError(
+                    "❓ Unrecognized content type - Expected 'input_text' or 'input_image'"
+                )
         return out
 
     def items_to_messages(
@@ -4013,7 +4509,9 @@ class _Converter:
                     }
                     result.append(msg_assistant)
                 else:
-                    raise UserError(f"👥 Invalid role '{role}' - Use: user, assistant, system, or developer")
+                    raise UserError(
+                        f"👥 Invalid role '{role}' - Use: user, assistant, system, or developer"
+                    )
 
             # 2) Check input message
             elif in_msg := self.maybe_input_message(item):
@@ -4040,7 +4538,9 @@ class _Converter:
                     }
                     result.append(msg_developer)
                 else:
-                    raise UserError(f"👥 Invalid message role '{role}' - Must be: user, system, or developer")
+                    raise UserError(
+                        f"👥 Invalid message role '{role}' - Must be: user, system, or developer"
+                    )
 
             # 3) response output message => assistant
             elif resp_msg := self.maybe_response_output_message(item):
@@ -4060,7 +4560,9 @@ class _Converter:
                             "🎵 Audio content must use audio IDs - Direct audio data not supported"
                         )
                     else:
-                        raise UserError("❓ Unknown assistant message content - Check message format")
+                        raise UserError(
+                            "❓ Unknown assistant message content - Check message format"
+                        )
 
                 if text_segments:
                     combined = "\n".join(text_segments)
@@ -4157,10 +4659,11 @@ class _Converter:
                             tool_call_details["execution_info"]["total_time"] = total_time
 
                 # Store the output so it can be accessed later
+                # Use truncated_call_id for consistency with message_history
                 if not hasattr(self, "tool_outputs"):
                     self.tool_outputs = {}
 
-                self.tool_outputs[call_id] = output_content
+                self.tool_outputs[truncated_call_id] = output_content
 
                 # Display the tool output immediately with the matched tool call
                 from cai.util import cli_print_tool_output
@@ -4206,9 +4709,11 @@ class _Converter:
                 # Use already-calculated costs from COST_TRACKER instead of recalculating
                 if model_instance and hasattr(model_instance, "model"):
                     from cai.util import COST_TRACKER
-                    
+
                     # Use the last recorded costs instead of recalculating
-                    token_info["interaction_cost"] = getattr(COST_TRACKER, "last_interaction_cost", 0.0)
+                    token_info["interaction_cost"] = getattr(
+                        COST_TRACKER, "last_interaction_cost", 0.0
+                    )
                     token_info["total_cost"] = getattr(COST_TRACKER, "last_total_cost", 0.0)
 
                 # Check if we're in streaming mode
@@ -4249,7 +4754,6 @@ class _Converter:
                                     should_display = False
                             except:
                                 should_display = False
-                        
 
                 # Only display if it hasn't been shown during streaming
                 if should_display:
@@ -4267,6 +4771,7 @@ class _Converter:
 
                 # ATOMIC ADDITION: Add pending tool call and response together
                 # This ensures we never have tool calls without responses in history
+                already_added_to_history = False
                 if model_instance and hasattr(model_instance, "_pending_tool_calls"):
                     # Check if we have a pending tool call for this ID
                     if call_id in model_instance._pending_tool_calls:
@@ -4281,6 +4786,7 @@ class _Converter:
                             "content": func_output["output"],
                         }
                         model_instance.add_to_message_history(tool_response_msg)
+                        already_added_to_history = True
 
                         # Remove from pending
                         del model_instance._pending_tool_calls[call_id]
@@ -4292,23 +4798,26 @@ class _Converter:
                             # not as separate events
                             pass
 
-                # Now add the tool message with truncated call_id
-                msg: ChatCompletionToolMessageParam = {
-                    "role": "tool",
-                    "tool_call_id": truncated_call_id,
-                    "content": func_output["output"],
-                }
-                result.append(msg)
+                # Only add to result if not already added to message_history
+                # This prevents duplicate tool_result messages which cause API errors
+                # like "each tool_use must have a single result"
+                if not already_added_to_history:
+                    msg: ChatCompletionToolMessageParam = {
+                        "role": "tool",
+                        "tool_call_id": truncated_call_id,
+                        "content": func_output["output"],
+                    }
+                    result.append(msg)
 
             # 6) item reference => handle or raise
             elif item_ref := self.maybe_item_reference(item):
-                raise UserError(
-                    "🔗 Item references not supported - Include content directly"
-                )
+                raise UserError("🔗 Item references not supported - Include content directly")
 
             # 7) If we haven't recognized it => fail or ignore
             else:
-                raise UserError("❌ Invalid message format - Check documentation for supported types")
+                raise UserError(
+                    "❌ Invalid message format - Check documentation for supported types"
+                )
 
         flush_assistant_message()
         return result

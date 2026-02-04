@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import os
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -245,7 +246,16 @@ class RunImpl:
         function_results = []
         computer_results = []
         interrupt_exception = None
-        
+
+        # DEBUG: Log tool execution start
+        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+            print("\n" + "=" * 80)
+            print("🔧 CAI DEBUG: Starting tool execution...")
+            print(f"   Function tools to run: {len(processed_response.functions)}")
+            for i, tr in enumerate(processed_response.functions):
+                print(f"   [{i+1}] {tr.function_tool.name}")
+            print("=" * 80 + "\n")
+
         try:
             function_results, computer_results = await asyncio.gather(
                 function_task, computer_task
@@ -300,7 +310,17 @@ class RunImpl:
             
         new_step_items.extend([result.run_item for result in function_results])
         new_step_items.extend(computer_results)
-        
+
+        # DEBUG: Log tool execution completion
+        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+            print("\n" + "=" * 80)
+            print("🔧 CAI DEBUG: Tool execution completed!")
+            print(f"   Function results: {len(function_results)}")
+            for i, fr in enumerate(function_results):
+                output_preview = str(fr.output)[:100] + "..." if len(str(fr.output)) > 100 else str(fr.output)
+                print(f"   [{i+1}] {fr.tool.name}: {output_preview}")
+            print("=" * 80 + "\n")
+
         # Re-raise the interruption after ensuring results are added
         if interrupt_exception:
             raise interrupt_exception

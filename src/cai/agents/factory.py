@@ -47,12 +47,13 @@ def create_generic_agent_factory(
             
             
         api_key = os.getenv("OPENAI_API_KEY", "sk-placeholder-key-for-local-models")
+        base_url = os.getenv("OPENAI_BASE_URL")  # Support custom API endpoint
 
         # Create a new model instance with the original agent name
         # Custom name is only for display purposes, not for the model
         new_model = OpenAIChatCompletionsModel(
             model=model_name,
-            openai_client=AsyncOpenAI(api_key=api_key),
+            openai_client=AsyncOpenAI(api_key=api_key, base_url=base_url),
             agent_name=original_agent.name,  # Always use original agent name
             agent_id=agent_id,
             agent_type=agent_var_name,  # Pass the agent type for registry

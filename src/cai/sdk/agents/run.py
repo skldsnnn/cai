@@ -332,6 +332,12 @@ class Runner:
                         current_span = None
                         should_run_agent_start_hooks = True
                     elif isinstance(turn_result.next_step, NextStepRunAgain):
+                        # DEBUG: Log run again
+                        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+                            print("\n" + "=" * 80)
+                            print(f"🔄 CAI DEBUG: NextStepRunAgain - Starting turn {current_turn + 1}")
+                            print(f"   Generated items so far: {len(generated_items)}")
+                            print("=" * 80 + "\n")
                         pass
                     else:
                         raise AgentsException(
@@ -826,6 +832,14 @@ class Runner:
         should_run_agent_start_hooks: bool,
         tool_use_tracker: AgentToolUseTracker,
     ) -> SingleStepResult:
+        # DEBUG: Log single turn start
+        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+            print("\n" + "=" * 80)
+            print(f"🔄 CAI DEBUG: _run_single_turn started for agent: {agent.name}")
+            print(f"   Generated items: {len(generated_items)}")
+            print(f"   Should run agent start hooks: {should_run_agent_start_hooks}")
+            print("=" * 80 + "\n")
+
         # Ensure we run the hooks before anything else
         if should_run_agent_start_hooks:
             await asyncio.gather(
@@ -1032,6 +1046,13 @@ class Runner:
         run_config: RunConfig,
         tool_use_tracker: AgentToolUseTracker,
     ) -> ModelResponse:
+        # DEBUG: Log get new response
+        if os.getenv("CAI_DEBUG_REQUEST", "").lower() == "true":
+            print("\n" + "=" * 80)
+            print(f"🔄 CAI DEBUG: _get_new_response called")
+            print(f"   Input items count: {len(input) if isinstance(input, list) else 1}")
+            print("=" * 80 + "\n")
+
         model = cls._get_model(agent, run_config)
         model_settings = agent.model_settings.resolve(run_config.model_settings)
         model_settings = RunImpl.maybe_reset_tool_choice(agent, tool_use_tracker, model_settings)
